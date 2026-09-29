@@ -1,18 +1,34 @@
 package com.serviceops.mobile
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.net.Uri
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.core.content.edit
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
+import java.util.UUID
 
 class ServiceOpsStore(context: Context) {
-    private val preferences = context.getSharedPreferences("service_ops_data", Context.MODE_PRIVATE)
+    private val appContext = context.applicationContext
+    private val preferences = appContext.getSharedPreferences("service_ops_data", Context.MODE_PRIVATE)
 
     val locations = mutableStateListOf<Location>()
     val logs = mutableStateListOf<ServiceLog>()
     val tasks = mutableStateListOf<WorkTask>()
     val invoices = mutableStateListOf<Invoice>()
     val references = mutableStateListOf<ReferenceNote>()
+    val chatMessages = mutableStateListOf<ChatMessage>()
+
+    var llmBaseUrl by mutableStateOf(preferences.getString("llm_base_url", "http://10.0.2.2:8080/v1") ?: "http://10.0.2.2:8080/v1")
+        private set
+    var llmModel by mutableStateOf(preferences.getString("llm_model", "cyber-tiel") ?: "cyber-tiel")
+        private set
 
     init {
         load()
@@ -26,10 +42,77 @@ class ServiceOpsStore(context: Context) {
         save()
     }
 
-    fun addLog(locationId: Long?, title: String, details: String) {
-        logs.add(0, ServiceLog(nextId(), locationId, title.trim(), details.trim(), System.currentTimeMillis()))
+    fun addLog(locationId: Long?, title: String, details: String, photoPaths: List<String> = emptyList()) {
+        logs.add(0, ServiceLog(nextId(), locationId, title.trim(), details.trim(), System.currentTimeMillis(), photoPaths))
         save()
     }
+
+    fun addChatMessage(
+        role: String,
+        text: String,
+        locationId: Long?,
+        photoPaths: List<String> = emptyList(),
+        draftTitle: String = "",
+        draftDetails: String = ""
+    ): Long {
+        val id = nextId()
+        chatMessages += ChatMessage(
+            id = id,
+            role = role,
+            text = text.trim(),
+            locationId = locationId,
+            createdAt = System.currentTimeMillis(),
+            photoPaths = photoPaths,
+            draftTitle = draftTitle.trim(),
+            draftDetails = draftDetails.trim()
+        )
+        save()
+        return id
+    }
+
+    fun saveChatDraftToHistory(messageId: Long) {
+        val index = chatMessages.indexOfFirst { it.id == messageId }
+        if (index < 0) return
+        val message = chatMessages[index]
+        if (message.savedToHistory || message.draftTitle.isBlank()) return
+        logs.add(0, ServiceLog(
+            id = nextId(),
+            locationId = message.locationId,
+            title = message.draftTitle,
+            details = message.draftDetails,
+            createdAt = System.currentTimeMillis(),
+            photoPaths = message.photoPaths
+        ))
+        chatMessages[index] = message.copy(savedToHistory = true)
+        save()
+    }
+
+    fun updateLlmSettings(baseUrl: String, model: String) {
+        llmBaseUrl = baseUrl.trim().trimEnd('/')
+        llmModel = model.trim().ifBlank { "cyber-tiel" }
+        preferences.edit {
+            putString("llm_base_url", llmBaseUrl)
+            putString("llm_model", llmModel)
+        }
+    }
+
+    fun importPhoto(uri: Uri): String? = runCatching {
+        val directory = File(appContext.filesDir, "service_photos").apply { mkdirs() }
+        val destination = File(directory, "photo_${System.currentTimeMillis()}_${UUID.randomUUID()}.jpg")
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        appContext.contentResolver.openInputStream(uri).use { input -> BitmapFactory.decodeStream(input, null, bounds) }
+        var sampleSize = 1
+        while (maxOf(bounds.outWidth, bounds.outHeight) / sampleSize > 1800) sampleSize *= 2
+        val options = BitmapFactory.Options().apply { inSampleSize = sampleSize }
+        val bitmap = appContext.contentResolver.openInputStream(uri).use { input ->
+            requireNotNull(BitmapFactory.decodeStream(input, null, options)) { "Unable to decode selected photo" }
+        }
+        destination.outputStream().use { output ->
+            bitmap.compress(Bitmap.CompressFormat.JPEG, 85, output)
+        }
+        bitmap.recycle()
+        destination.absolutePath
+    }.getOrNull()
 
     fun addTask(title: String, due: String, priority: String) {
         tasks += WorkTask(nextId(), title.trim(), due.trim(), priority)
@@ -60,7 +143,17 @@ class ServiceOpsStore(context: Context) {
 
     fun locationName(id: Long?): String = locations.firstOrNull { it.id == id }?.name ?: "General"
 
-    private fun nextId(): Long = System.currentTimeMillis() + (0..999).random()
+    private fun nextId(): Long {
+        val largestStoredId = listOfNotNull(
+            locations.maxOfOrNull { it.id },
+            logs.maxOfOrNull { it.id },
+            tasks.maxOfOrNull { it.id },
+            invoices.maxOfOrNull { it.id },
+            references.maxOfOrNull { it.id },
+            chatMessages.maxOfOrNull { it.id }
+        ).maxOrNull() ?: 0L
+        return maxOf(System.currentTimeMillis(), largestStoredId + 1L)
+    }
 
     private fun addStarterData() {
         val locationId = nextId()
@@ -80,6 +173,7 @@ class ServiceOpsStore(context: Context) {
         root.put("logs", JSONArray().apply { logs.forEach { item -> put(JSONObject().apply {
             put("id", item.id); put("locationId", item.locationId ?: JSONObject.NULL); put("title", item.title)
             put("details", item.details); put("createdAt", item.createdAt)
+            put("photoPaths", JSONArray(item.photoPaths))
         }) } })
         root.put("tasks", JSONArray().apply { tasks.forEach { item -> put(JSONObject().apply {
             put("id", item.id); put("title", item.title); put("due", item.due)
@@ -92,7 +186,13 @@ class ServiceOpsStore(context: Context) {
         root.put("references", JSONArray().apply { references.forEach { item -> put(JSONObject().apply {
             put("id", item.id); put("title", item.title); put("body", item.body); put("tag", item.tag)
         }) } })
-        preferences.edit().putString("data", root.toString()).apply()
+        root.put("chatMessages", JSONArray().apply { chatMessages.forEach { item -> put(JSONObject().apply {
+            put("id", item.id); put("role", item.role); put("text", item.text)
+            put("locationId", item.locationId ?: JSONObject.NULL); put("createdAt", item.createdAt)
+            put("photoPaths", JSONArray(item.photoPaths)); put("draftTitle", item.draftTitle)
+            put("draftDetails", item.draftDetails); put("savedToHistory", item.savedToHistory)
+        }) } })
+        preferences.edit { putString("data", root.toString()) }
     }
 
     private fun load() {
@@ -105,7 +205,8 @@ class ServiceOpsStore(context: Context) {
             ) }
             root.optJSONArray("logs")?.forEachObject { item -> logs += ServiceLog(
                 item.getLong("id"), if (item.isNull("locationId")) null else item.getLong("locationId"),
-                item.optString("title"), item.optString("details"), item.optLong("createdAt")
+                item.optString("title"), item.optString("details"), item.optLong("createdAt"),
+                item.optJSONArray("photoPaths").toStringList()
             ) }
             root.optJSONArray("tasks")?.forEachObject { item -> tasks += WorkTask(
                 item.getLong("id"), item.optString("title"), item.optString("due"),
@@ -118,8 +219,19 @@ class ServiceOpsStore(context: Context) {
             root.optJSONArray("references")?.forEachObject { item -> references += ReferenceNote(
                 item.getLong("id"), item.optString("title"), item.optString("body"), item.optString("tag")
             ) }
+            root.optJSONArray("chatMessages")?.forEachObject { item -> chatMessages += ChatMessage(
+                item.getLong("id"), item.optString("role"), item.optString("text"),
+                if (item.isNull("locationId")) null else item.getLong("locationId"), item.optLong("createdAt"),
+                item.optJSONArray("photoPaths").toStringList(), item.optString("draftTitle"),
+                item.optString("draftDetails"), item.optBoolean("savedToHistory")
+            ) }
         }
     }
+}
+
+private fun JSONArray?.toStringList(): List<String> {
+    if (this == null) return emptyList()
+    return (0 until length()).map { index -> optString(index) }.filter { it.isNotBlank() }
 }
 
 private inline fun JSONArray.forEachObject(block: (JSONObject) -> Unit) {

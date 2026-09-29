@@ -13,7 +13,20 @@ data class ServiceLog(
     val locationId: Long?,
     val title: String,
     val details: String,
-    val createdAt: Long
+    val createdAt: Long,
+    val photoPaths: List<String> = emptyList()
+)
+
+data class ChatMessage(
+    val id: Long,
+    val role: String,
+    val text: String,
+    val locationId: Long?,
+    val createdAt: Long,
+    val photoPaths: List<String> = emptyList(),
+    val draftTitle: String = "",
+    val draftDetails: String = "",
+    val savedToHistory: Boolean = false
 )
 
 data class WorkTask(
